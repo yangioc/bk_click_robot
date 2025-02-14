@@ -3,7 +3,10 @@ package main
 import (
 	"bk_click_robot/controller"
 	"fmt"
+	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -21,11 +24,28 @@ func main() {
 		}
 	}()
 
-	controller.Hook(0x73, func() {
-		fmt.Println("Click")
-		un := !lock.Load()
-		lock.Store(un)
+	// 設定快捷鍵
+	if err := controller.SetHotKey(1, controller.MOD_NOREPEAT, 0x73); err != nil { // F4
+		fmt.Println(err)
+		return
+	}
+	defer controller.UnsetHotKey(1)
+
+	// 訊號處理 (允許 Ctrl+C 退出)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 啟動熱鍵監聽
+	go controller.RunHotKeyListener(func(id uintptr) {
+		switch id {
+		case 1:
+			fmt.Println("Click")
+			un := !lock.Load()
+			lock.Store(un)
+		}
 	})
-	fmt.Println("finish")
-	select {}
+
+	// 等待系統訊號
+	<-sigChan
+	fmt.Println("程式結束")
 }

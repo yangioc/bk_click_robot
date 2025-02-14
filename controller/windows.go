@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -18,6 +19,11 @@ const (
 	KEYEVENTF_KEYUP   = 0x0002
 
 	WH_KEYBOARD_LL = 13
+
+	WM_HOTKEY = 0x0312
+
+	MOD_NOREPEAT = 0x4000
+	MOD_CONTROL  = 0x0002
 )
 
 var (
@@ -29,6 +35,9 @@ var (
 	procGetAsyncKey      = user32.NewProc("GetAsyncKeyState") // 加載 GetAsyncKeyState
 	procCallNextHookEx   = user32.NewProc("CallNextHookEx")
 	procSetWindowsHookEx = user32.NewProc("SetWindowsHookExW")
+	procRegisterHotKey   = user32.NewProc("RegisterHotKey")
+	procUnregisterHotKey = user32.NewProc("UnregisterHotKey")
+	procGetMessage       = user32.NewProc("GetMessageW")
 )
 
 type POINT struct {
@@ -114,6 +123,8 @@ func isKeyPressed(vkCode uint8) bool {
 	return state&0x8000 != 0
 }
 
+///// 監聽事件操作
+
 type KBDLLHOOKSTRUCT struct {
 	VkCode   uint32
 	ScanCode uint32
@@ -122,42 +133,99 @@ type KBDLLHOOKSTRUCT struct {
 	DwExtra  uintptr
 }
 
-func Hook(key uint32, callaback func()) {
-	// hook, _, err := procSetWindowsHookEx.Call(uintptr(WH_KEYBOARD_LL), syscall.NewCallback(keyboardProc), 0, 0)
-	// if hook == 0 {
-	// 	fmt.Println("Error setting hook:", err)
-	// 	return
-	// }
+var callbackMap = map[uint32]func(){}
+var muLock sync.RWMutex
 
-	// cannot use func(nCode int, wParam, lParam uintptr) uintptr {…}
-	// (value of type func(nCode int, wParam uintptr, lParam uintptr) uintptr) as
-	// uintptr value in argument to procSetWindowsHookEx.Call
+func delCallback(key uint32) {
+	muLock.Lock()
+	defer muLock.Unlock()
 
-	hook, _, err := procSetWindowsHookEx.Call(uintptr(WH_KEYBOARD_LL),
-		syscall.NewCallback(func(nCode int, wParam, lParam uintptr) uintptr {
-			if nCode == 0 {
-				keyboard := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
-				fmt.Printf("Key Pressed: %d\n", keyboard.VkCode)
-				if keyboard.VkCode == key {
-					callaback()
-				}
-			}
-			// 傳遞事件
-			ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
-			return ret
-		}), 0, 0)
-	if hook == 0 {
-		fmt.Println("Error setting hook:", err)
-		return
+	delete(callbackMap, key)
+}
+func setCallback(key uint32, callaback func()) error {
+	muLock.Lock()
+	defer muLock.Unlock()
+
+	if _, exsit := callbackMap[key]; exsit {
+		return fmt.Errorf("callback exist;")
 	}
+
+	callbackMap[key] = callaback
+	return nil
+}
+func getCallback(key uint32) func() {
+	muLock.RLock()
+	defer muLock.RUnlock()
+
+	return callbackMap[key]
 }
 
-// func keyboardProc(nCode int, wParam, lParam uintptr) uintptr {
-// 	if nCode == 0 {
-// 		keyboard := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
-// 		fmt.Printf("Key Pressed: %d\n", keyboard.VkCode)
-// 	}
-// 	// 傳遞事件
-// 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
-// 	return ret
-// }
+func keyboardProc(nCode int, wParam, lParam uintptr) uintptr {
+	if nCode == 0 {
+		keyboard := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
+		fmt.Printf("Key Pressed: %d\n", keyboard.VkCode)
+		if callback := getCallback(keyboard.VkCode); callback != nil {
+			callback()
+		}
+	}
+	// 傳遞事件
+	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+	return ret
+}
+
+// 監聽鍵盤事件(未完成)
+func Hook(key uint32, callaback func()) error {
+	if err := setCallback(key, callaback); err != nil {
+		return err
+	}
+
+	if hook, _, err := procSetWindowsHookEx.Call(uintptr(WH_KEYBOARD_LL), syscall.NewCallback(keyboardProc), 0, 0); hook == 0 {
+		return fmt.Errorf("Error setting hook err: %v", err)
+	}
+	return nil
+}
+
+///// 熱鍵操作
+
+// 註冊快捷鍵
+func SetHotKey(id int, modifier, key uint32) error {
+	r1, _, err := procRegisterHotKey.Call(0, uintptr(id), uintptr(modifier), uintptr(key))
+	if r1 == 0 {
+		return fmt.Errorf("無法註冊快捷鍵 (ID: %d, Key: %d): %v", id, key, err)
+	}
+	if modifier == MOD_NOREPEAT {
+		fmt.Println("註冊了:", key)
+	} else {
+		fmt.Println("註冊了:", modifier, "+", key)
+	}
+	return nil
+}
+
+// 解除快捷鍵
+func UnsetHotKey(id int) {
+	procUnregisterHotKey.Call(0, uintptr(id))
+}
+
+// 監聽快捷鍵
+func RunHotKeyListener(callback func(uintptr)) {
+	fmt.Println("開始監聽快捷鍵...")
+	var msg struct {
+		hwnd    uintptr
+		message uint32
+		wParam  uintptr
+		lParam  uintptr
+		time    uint32
+		pt      struct{ x, y int32 }
+	}
+
+	for {
+		ret, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if ret == 0 { // WM_QUIT
+			break
+		}
+
+		if msg.message == WM_HOTKEY {
+			callback(msg.wParam)
+		}
+	}
+}
